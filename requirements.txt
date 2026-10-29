@@ -1,0 +1,13 @@
+# Зависимости серверной части Activity Tracker (только то, что ставит хостинг).
+# psutil нужен лишь локальному приложению VoiceTracker — он вынесен в
+# requirements-pc.txt, чтобы сборка на сервере была легче и быстрее.
+
+# Google Sheets API
+gspread>=6.0.0
+google-auth>=2.0.0
+
+# Загрузка скриншотов в Google Drive (через google-auth)
+requests>=2.28
+
+# Telegram Bot
+python-telegram-bot>=21.0
