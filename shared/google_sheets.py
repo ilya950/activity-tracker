@@ -4,6 +4,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import logging
@@ -165,6 +166,9 @@ def verify_access(spreadsheet_id: str, sheet_name: str = "Лист1"):
             f"Есть листы: {', '.join(titles) if titles else '—'}.\n"
             "Переименуйте лист или задайте переменную SHEET_NAME."
         )
+
+    # Лист «Итоги» собираем при старте: сумма смен каждого модератора за день.
+    recalc_totals(spreadsheet_id, sheet_name)
     return True, f"Таблица «{book.title}», лист «{sheet_name}» — доступ есть."
 
 
@@ -174,6 +178,183 @@ PHOTO_IN_COLUMN = 10
 PHOTO_OUT_COLUMN = 11
 PHOTO_IN_LETTER = "J"
 PHOTO_OUT_LETTER = "K"
+
+# H — «Дата» (для фильтра и сводки), I — «Отработано» за смену
+DATE_COLUMN_LETTER = "H"
+WORKED_COLUMN_LETTER = "I"
+TOTALS_SHEET_NAME = "Итоги"
+
+# Значения по умолчанию: таблицы у нас не меняются, а прописывать их в
+# переменные окружения каждый раз незачем (бот всё равно даёт переопределить).
+SPREADSHEET_FALLBACK = "19HDqMFo2Ysin9Bl1fIC9gZnc0qMnsVjmT0bgvZ6KXo0"
+SHEET_NAME_DEFAULT = "Лист1"
+
+# Формат «часы:минуты». Ключ type обязателен: без него Sheets API отвечает
+# «A number format type must be specified», и запись отработанного падала.
+NUMBER_FORMAT = {"type": "NUMBER", "pattern": "[h]:mm"}
+
+
+def to_minutes(value) -> int:
+    """Время из таблицы в минуты от полуночи. None/-1 если не читается.
+
+    Sheets отдаёт время по-разному: текст "09:22", float 0.39 (доля суток)
+    или "6.436178546E+09" для чисел — сводим всё к минутам.
+    """
+    if value is None:
+        return -1
+    if isinstance(value, (int, float)):
+        # Доля суток (формат времени Sheets) или уже минуты
+        if 0 <= value < 1:
+            return int(round(value * 24 * 60))
+        return -1
+
+    text = str(value).strip().replace(".", ":").replace(",", ":")
+    if not text:
+        return -1
+    parts = text.split(":")
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except ValueError:
+        return -1
+    if not 0 <= hours < 24 or not 0 <= minutes < 60:
+        return -1
+    return hours * 60 + minutes
+
+
+def _worked_cell_minutes(value) -> int:
+    """Минуты из колонки «Отработано»: "14:07", "0:45" или доля суток.
+
+    В отличие от to_minutes здесь часы могут быть больше 23 — формат [h]:mm
+    показывает сумму смен, и 25:30 тоже корректно.
+    """
+    if value is None or value == "":
+        return -1
+    if isinstance(value, (int, float)):
+        return int(round(value * 1440)) if 0 <= value < 1 else -1
+
+    parts = str(value).strip().split(":")
+    if len(parts) > 2:
+        parts = [parts[0], parts[1]]
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except ValueError:
+        return -1
+    if hours < 0 or not 0 <= minutes < 60:
+        return -1
+    return hours * 60 + minutes
+
+
+def worked_minutes(start, end) -> int:
+    """Длительность смены в минутах, -1 если время не читается.
+
+    Ночная смена (выход раньше входа) считается через полночь, иначе у
+    ночных модераторов выходил бы минус.
+    """
+    start_m, end_m = to_minutes(start), to_minutes(end)
+    if start_m < 0 or end_m < 0:
+        return -1
+    minutes = end_m - start_m
+    return minutes if minutes >= 0 else minutes + 24 * 60
+
+
+# Сводку «кто сколько отработал за день» считаем кодом, а не формулой QUERY:
+# в этой таблице (русская локаль, дата текстом) QUERY стабильно отдаёт #ERROR!.
+# Лист пересобирается целиком при каждой смене — ручная правка не «застынет».
+TOTALS_HEADERS = ["Дата", "Никнейм", "Отработано", "Смен"]
+
+
+def _totals_rows(rows) -> list:
+    """Группирует смены по (дата, никнейм) и суммирует минуты.
+
+    Строки приходят в отображаемом виде (FORMATTED_VALUE): иначе дата из
+    колонки «Число» отдаётся серийным числом (46324) и в сводке был бы набор
+    цифр вместо «29.10.2026».
+    """
+    totals = {}
+    for row in rows:
+        nickname = str(row[0]).strip() if len(row) > 0 else ""
+        if not nickname:
+            continue
+        start = row[2] if len(row) > 2 else ""
+        end = row[3] if len(row) > 3 else ""
+        date_str = str(row[4]).strip() if len(row) > 4 else ""
+        worked = str(row[7]).strip() if len(row) > 7 else ""
+
+        if not str(end).strip():
+            continue  # смена ещё не закрыта — в итог она не входит
+
+        minutes = _worked_cell_minutes(worked)
+        if minutes < 0:
+            minutes = max(worked_minutes(start, end), 0)
+
+        key = (date_str, nickname.lower())
+        entry = totals.setdefault(key, {"date": date_str, "nickname": nickname,
+                                        "minutes": 0, "shifts": 0})
+        entry["minutes"] += minutes
+        entry["shifts"] += 1
+
+    def sort_key(entry):
+        # Даты в формате "ДД.ММ.ГГГГ" текстом: лексикографически они не
+        # сортируются, поэтому разбираем на (год, месяц, день) — свежие сверху.
+        parts = re.split(r"[.:/-]", entry["date"])
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            day, month, year = (int(p) for p in parts)
+            return (-year, -month, -day, entry["nickname"].lower())
+        return (0, 0, 0, entry["nickname"].lower())
+
+    ordered = sorted(totals.values(), key=sort_key)
+    return [[e["date"], e["nickname"], e["minutes"] / 1440, e["shifts"]]
+            for e in ordered]
+
+
+def recalc_totals(spreadsheet_id: str, sheet_name: str = "Лист1") -> int:
+    """Пересобирает лист «Итоги»: Дата | Никнейм | Отработано | Смен.
+
+    Возвращает количество строк сводки. Ошибку не поднимает: сводка —
+    удобство, падать из-за неё при записи смены нельзя.
+    """
+    try:
+        spreadsheet = get_spreadsheet(spreadsheet_id)
+        source = spreadsheet.worksheet(sheet_name)
+    except Exception as exc:
+        logger.warning("Итоги: не удалось открыть «%s»: %s", sheet_name, exc)
+        return 0
+
+    try:
+        rows = source.get("B4:I", value_render_option="FORMATTED_VALUE")
+    except Exception as exc:
+        logger.warning("Итоги: не удалось прочитать смены: %s", exc)
+        return 0
+
+    data = _totals_rows(rows)
+
+    try:
+        try:
+            totals = spreadsheet.worksheet(TOTALS_SHEET_NAME)
+        except Exception:
+            totals = spreadsheet.add_worksheet(
+                title=TOTALS_SHEET_NAME, rows=max(len(data) + 20, 50), cols=4
+            )
+        if totals.row_count < len(data) + 2:
+            totals.resize(len(data) + 20, 4)
+
+        # Старые строки сводки затираем: смены могли удалить или поправить
+        stale = totals.row_count - 1 - len(data)
+        if stale > 0:
+            totals.update(values=[[""] * 4] * stale,
+                          range_name=f"A{len(data) + 2}:D{totals.row_count}", raw=True)
+
+        totals.update(values=[TOTALS_HEADERS] + data,
+                      range_name=f"A1:D{len(data) + 1}", raw=True)
+        totals.format("C2:C2000", {"numberFormat": NUMBER_FORMAT})
+    except Exception as exc:
+        logger.warning("Итоги: не удалось записать сводку: %s", exc)
+        return 0
+
+    logger.info("Лист «%s» пересобран: %d строк", TOTALS_SHEET_NAME, len(data))
+    return len(data)
 
 
 def _ensure_photo_headers(worksheet) -> None:
@@ -203,6 +384,37 @@ def _next_free_row(worksheet) -> int:
         if str(value).strip():
             last = index
     return max(last + 1, 4)
+
+
+def _fill_worked_columns(spreadsheet_id: str, sheet_name: str, row_number: int,
+                         date_str: str, with_worked: bool) -> None:
+    """Дописывает «Дата» (H) и «Отработано» (I) в уже созданную строку.
+
+    Нужно как страховка: локальное приложение пишет в таблицу через Apps
+    Script, и если там осталась старая версия без расчёта, колонки были бы
+    пустые. Бот ключ Google имеет, поэтому допишет сам. Ошибку не поднимаем:
+    смена уже записана, ронять ответ из-за служебной колонки нельзя.
+    """
+    if not row_number:
+        return
+    try:
+        worksheet = get_spreadsheet(spreadsheet_id).worksheet(sheet_name)
+        if date_str:
+            worksheet.update(values=[[date_str]],
+                             range_name=f"{DATE_COLUMN_LETTER}{row_number}", raw=True)
+        if not with_worked:
+            return
+        start = worksheet.cell(row_number, 4).value
+        end = worksheet.cell(row_number, 5).value
+        minutes = worked_minutes(start, end)
+        if minutes >= 0:
+            worksheet.update(values=[[minutes / 1440]],
+                             range_name=f"{WORKED_COLUMN_LETTER}{row_number}", raw=True)
+            worksheet.format(f"{WORKED_COLUMN_LETTER}{row_number}",
+                             {"numberFormat": NUMBER_FORMAT})
+    except Exception as exc:
+        logger.warning("Не удалось дописать дату/отработанное в строку %s: %s",
+                       row_number, exc)
 
 
 def append_activity_record(
@@ -242,6 +454,11 @@ def append_activity_record(
         })
         if not result.get("ok", False):
             raise RuntimeError(result.get("error", "сервер записи вернул ошибку"))
+        # Apps Script мог остаться старой версии — допишем дату сами и
+        # обновим сводку, чтобы «Итоги» не отставали от реальных смен.
+        _fill_worked_columns(spreadsheet_id, sheet_name, result.get("row"),
+                             date_str, with_worked=False)
+        recalc_totals(spreadsheet_id, sheet_name)
         logger.info("Запись добавлена через веб-приложение: %s", nickname)
         return True
 
@@ -262,6 +479,10 @@ def append_activity_record(
         values=[row], range_name=f"B{next_row}:F{next_row}", raw=True
     )
 
+    # Дата в H — по ней лист «Итоги» собирает смены одного человека за день
+    worksheet.update(values=[[date_str]],
+                     range_name=f"{DATE_COLUMN_LETTER}{next_row}", raw=True)
+
     # Ссылка на скриншот входа — в колонку K («Фото входа»)
     if photo_url:
         _ensure_photo_headers(worksheet)
@@ -279,6 +500,7 @@ def append_activity_record(
         end_time,
         date_str,
     )
+    recalc_totals(spreadsheet_id, sheet_name)
     return True
 
 
@@ -288,6 +510,7 @@ def update_end_time(
     end_time: str,
     sheet_name: str = "Лист1",
     photo_url: str = "",
+    date_str: str = "",
 ):
     """
     Обновляет время окончания для последней записи пользователя,
@@ -313,7 +536,15 @@ def update_end_time(
         })
         if not result.get("ok", False):
             raise RuntimeError(result.get("error", "сервер записи вернул ошибку"))
-        return bool(result.get("updated", False))
+        updated = bool(result.get("updated", False))
+        if updated:
+            # Дата и «Отработано» — страховка на случай старой версии скрипта;
+            # сводку пересобираем, чтобы «Итоги» всегда соответствовали сменам.
+            row_number = result.get("row")
+            _fill_worked_columns(spreadsheet_id, sheet_name, row_number,
+                                 date_str, with_worked=True)
+            recalc_totals(spreadsheet_id, sheet_name)
+        return updated
 
     spreadsheet = get_spreadsheet(spreadsheet_id)
     
@@ -337,6 +568,25 @@ def update_end_time(
                 values=[[end_time]], range_name=f"E{row_num}", raw=True
             )
 
+            # «Отработано» (I) — долей суток (0.5 = 12ч) с форматом [h]:mm:
+            # в таком виде смены одного модератора складываются в лист «Итоги».
+            start_value = row[2] if len(row) > 2 else ""
+            minutes = worked_minutes(start_value, end_time)
+            if minutes >= 0:
+                worksheet.update(
+                    values=[[minutes / 1440]],
+                    range_name=f"{WORKED_COLUMN_LETTER}{row_num}", raw=True,
+                )
+                worksheet.format(
+                    f"{WORKED_COLUMN_LETTER}{row_num}",
+                    {"numberFormat": NUMBER_FORMAT},
+                )
+            if date_str:
+                worksheet.update(
+                    values=[[date_str]],
+                    range_name=f"{DATE_COLUMN_LETTER}{row_num}", raw=True,
+                )
+
             # Ссылка на скриншот выхода — в колонку L («Фото выхода»)
             if photo_url:
                 _ensure_photo_headers(worksheet)
@@ -347,6 +597,7 @@ def update_end_time(
                 )
 
             logger.info("Обновлено время выхода для %s: %s", nickname, end_time)
+            recalc_totals(spreadsheet_id, sheet_name)
             return True
     
     return False

@@ -540,6 +540,7 @@ async def leave_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             end_time=end_time,
             sheet_name=SHEET_NAME,
             photo_url=photo_url,
+            date_str=date_str,
         )
     except Exception as exc:
         logger.error("Ошибка обновления Google Sheets: %s", exc)
